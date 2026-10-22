@@ -9,7 +9,7 @@ from .client import make_client
 from .tools import build_tools, execute
 
 WEB = Path(__file__).parent / "web"
-SESSION = secrets.token_urlsafe(24)
+SESSION = hmac.new((os.getenv("LIARA_SESSION_SECRET") or os.getenv("LIARA_WEB_PASSWORD") or secrets.token_urlsafe(32)).encode("utf-8"), b"liara-sre-agent-session-v1", "sha256").hexdigest()
 MAX_BODY, LOCK = 65536, threading.RLock()
 S = {"tools": None, "st": brain.new_state(), "port": 8080, "chat_times": deque()}
 
