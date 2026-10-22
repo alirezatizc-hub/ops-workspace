@@ -71,30 +71,49 @@ def doctor(name):
 
 
 def chat():
-    import anthropic
+    from openai import OpenAI
     tools = build_tools(make_client())
-    spec = [{"name": t.name, "description": t.description, "input_schema": t.schema} for t in tools.values()]
-    ai, model = anthropic.Anthropic(), os.getenv("LIARA_AGENT_MODEL", "claude-sonnet-5-5")
+    spec = [{"type": "function", "function": {
+        "name": t.name, "description": t.description, "parameters": t.schema
+    }} for t in tools.values()]
+    ai = OpenAI(
+        api_key=os.environ.get("BOXAPI_API_KEY"),
+        base_url=os.getenv("BOXAPI_BASE_URL", "https://ai.boxapi.ir/ai/v1").rstrip("/"),
+        timeout=45.0,
+        max_retries=1,
+    )
+    model = os.getenv("LIARA_AGENT_MODEL", "gpt-5.4-mini")
     msgs = []
-    con.print(Panel("سلام! من دستیار لیارا هستم 👋\nمثلاً بگو: «سایتم ارور ۵۰۰ میده» یا «می‌خوام پروژه نود رو بالا بیارم». خروج: exit", border_style="cyan"))
+    con.print(Panel("سلام! من دستیار لیارا هستم 👋\\nمثلاً بگو: «سایتم ارور ۵۰۰ میده» یا «می‌خوام پروژه نود رو بالا بیارم». خروج: exit", border_style="cyan"))
     while True:
         q = Prompt.ask("[bold cyan]شما[/bold cyan]")
         if q.strip().lower() in ("exit", "quit", "خروج"):
             return
         msgs.append({"role": "user", "content": q})
         while True:
-            r = ai.messages.create(model=model, max_tokens=1500, system=SYSTEM, tools=spec, messages=msgs)
-            msgs.append({"role": "assistant", "content": r.content})
-            for b in r.content:
-                if b.type == "text" and b.text.strip():
-                    con.print(Panel(b.text, title="دستیار", border_style="green"))
-            uses = [b for b in r.content if b.type == "tool_use"]
+            r = ai.chat.completions.create(
+                model=model,
+                messages=[{"role": "system", "content": SYSTEM}, *msgs],
+                tools=spec,
+                max_tokens=1500,
+            )
+            m = r.choices[0].message
+            msgs.append(m.model_dump(exclude_none=True))
+            if m.content and m.content.strip():
+                con.print(Panel(m.content, title="دستیار", border_style="green"))
+            uses = m.tool_calls or []
             if not uses:
                 break
-            msgs.append({"role": "user", "content": [
-                {"type": "tool_result", "tool_use_id": u.id,
-                 "content": json.dumps(run_tool(tools, u.name, u.input), ensure_ascii=False)} for u in uses]})
-
+            results = []
+            for u in uses:
+                try:
+                    args = json.loads(u.function.arguments or "{}")
+                    result = run_tool(tools, u.function.name, args)
+                except (TypeError, json.JSONDecodeError):
+                    result = {"status": "error", "message": "آرگومان ابزار نامعتبر بود."}
+                results.append({"role": "tool", "tool_call_id": u.id,
+                                "content": json.dumps(result, ensure_ascii=False)})
+            msgs.extend(results)
 
 def main():
     p = argparse.ArgumentParser(prog="liara-agent")
