@@ -7,7 +7,7 @@ verified=False یعنی تأیید نشده؛ پیش‌فرض غیرفعال ا�
 import json, os, re, time, urllib.error, urllib.parse, urllib.request
 from .security import ValidationError, redact, validate_app_name
 
-DEFAULT_BASE = "https://api.iran.liara.ir"   # نمونه‌ی مستندات رسمی؛ spec رسمی https://api.liara.ir را هم ذکر می‌کند
+DEFAULT_BASE = "https://api.liara.ir"   # آدرس پایه‌ی PaaS طبق spec رسمی فعلی liara-cloud/openapi/spec/paas.yaml
 HOST_OK = re.compile(r"^(?:[a-z0-9-]+\.)*liara\.ir$")
 MAX_BYTES = 2_000_000
 
