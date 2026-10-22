@@ -95,7 +95,7 @@ def chat():
                 model=model,
                 messages=[{"role": "system", "content": SYSTEM}, *msgs],
                 tools=spec,
-                max_tokens=1500,
+                max_completion_tokens=1500,
             )
             m = r.choices[0].message
             msgs.append(m.model_dump(exclude_none=True))
