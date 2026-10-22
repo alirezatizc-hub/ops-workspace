@@ -149,41 +149,66 @@ def _rules(msg, app, tools, st, url):
 
 
 def _llm(msg, app, tools, st, url):
-    import anthropic
+    from openai import OpenAI
     from .agent import SYSTEM
-    ai = anthropic.Anthropic(); model = os.getenv("LIARA_AGENT_MODEL", "claude-sonnet-5-5")
-    spec = [{"name": t.name, "description": t.description, "input_schema": t.schema} for t in tools.values()]
+    ai = OpenAI(
+        api_key=os.environ["BOXAPI_API_KEY"],
+        base_url=os.getenv("BOXAPI_BASE_URL", "https://ai.boxapi.ir/ai/v1").rstrip("/"),
+        timeout=45.0,
+        max_retries=1,
+    )
+    model = os.getenv("LIARA_AGENT_MODEL", "gpt-5.4-mini")
+    spec = [{"type": "function", "function": {
+        "name": t.name, "description": t.description, "parameters": t.schema
+    }} for t in tools.values()]
     st["msgs"].append({"role": "user", "content": f"[اپ فعلی: {app}] {msg}"})
     out = []
     for _ in range(6):
-        r = ai.messages.create(model=model, max_tokens=1200, system=SYSTEM, tools=spec, messages=st["msgs"])
-        st["msgs"].append({"role": "assistant", "content": r.content})
-        res = []
-        for b in r.content:
-            if b.type == "text" and b.text.strip():
-                out.append(ev("text", text=b.text))
-            if b.type == "tool_use":
-                x = execute(tools, b.name, b.input)
-                if x["status"] == "needs_confirmation":
-                    out.append(_confirm(tools, st, b.name, b.input, "نیاز به تأیید شما"))
-                    x = {"status": "waiting", "message": "منتظر تأیید کاربر در UI؛ پاسخ را کوتاه کن و منتظر بمان."}
-                else:
-                    out.append(ev("step", text=LABELS.get(b.name, b.name)))
-                    if b.name == "diagnose_app" and x["status"] == "ok":
-                        st["last"] = x["result"]; out.append(ev("report", data=x["result"]))
-                res.append({"type": "tool_result", "tool_use_id": b.id, "content": json.dumps(x, ensure_ascii=False)})
-        if not res:
+        r = ai.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": SYSTEM}, *st["msgs"]],
+            tools=spec,
+            max_tokens=1200,
+        )
+        m = r.choices[0].message
+        assistant_msg = m.model_dump(exclude_none=True)
+        st["msgs"].append(assistant_msg)
+        if m.content and m.content.strip():
+            out.append(ev("text", text=m.content))
+        calls = m.tool_calls or []
+        if not calls:
             break
-        st["msgs"].append({"role": "user", "content": res})
+        results = []
+        for call in calls:
+            try:
+                args = json.loads(call.function.arguments or "{}")
+            except (TypeError, json.JSONDecodeError):
+                args = {}
+                x = {"status": "error", "message": "مدل آرگومان ابزار نامعتبر فرستاد."}
+            else:
+                x = execute(tools, call.function.name, args)
+            if x["status"] == "needs_confirmation":
+                out.append(_confirm(tools, st, call.function.name, args, "نیاز به تأیید شما"))
+                x = {"status": "waiting", "message": "منتظر تأیید کاربر در UI."}
+                results.append({"role": "tool", "tool_call_id": call.id,
+                                "content": json.dumps(x, ensure_ascii=False)})
+                st["msgs"].extend(results)
+                return out
+            out.append(ev("step", text=LABELS.get(call.function.name, call.function.name)))
+            if call.function.name == "diagnose_app" and x["status"] == "ok":
+                st["last"] = x["result"]
+                out.append(ev("report", data=x["result"]))
+            results.append({"role": "tool", "tool_call_id": call.id,
+                            "content": json.dumps(x, ensure_ascii=False)})
+        st["msgs"].extend(results)
     return out
-
 
 def handle(msg, app, tools, st, url=""):
     msg = (msg or "")[:2000]
     st["url"] = url if isinstance(url, str) else ""
-    if os.getenv("ANTHROPIC_API_KEY") and os.getenv("LIARA_NO_LLM") != "1":
+    if os.getenv("BOXAPI_API_KEY") and os.getenv("LIARA_NO_LLM") != "1":
         try:
             return _llm(msg, app, tools, st, url)
         except Exception as e:
-            return [ev("step", text=f"LLM در دسترس نبود ({type(e).__name__}) — حالت ساده")] + _rules(msg, app, tools, st, url)
+            return [ev("step", text=f"هوش مصنوعی BoxAPI در دسترس نبود ({type(e).__name__}) — حالت ساده")] + _rules(msg, app, tools, st, url)
     return _rules(msg, app, tools, st, url)

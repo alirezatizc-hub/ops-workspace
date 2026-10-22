@@ -73,7 +73,7 @@ cp .env.example .env && export $(grep -v '^#' .env | xargs)   # یا متغیر�
 ```bash
 python -m liara_agent web            # → http://127.0.0.1:8080
 python -m liara_agent doctor <app>   # عیب‌یابی در ترمینال
-python -m liara_agent chat           # چت (نیازمند ANTHROPIC_API_KEY)
+python -m liara_agent chat           # چت هوشمند (نیازمند BOXAPI_API_KEY)
 python -m liara_agent.mcp_server     # MCP (فقط‌خواندنی؛ برای تغییر: LIARA_MCP_ALLOW_MUTATIONS=1)
 ```
 برای دیپلوی: نصب `@liara/cli` و `git`، و اپ مقصد باید از قبل در لیارا ساخته شده باشد.
@@ -102,7 +102,7 @@ python tests/run.py        # بدون pytest؛ با pytest هم قابل‌اج�
 
 ## استقرار روی لیارا
 
-مخزن شامل `Procfile` است و فرمان شروع برنامه `python -m liara_agent web` می‌باشد. در تنظیمات متغیرهای محیطی برنامه در لیارا این دو متغیر را با مقادیر محرمانه تنظیم کنید:
+مخزن شامل `Procfile` است و فرمان شروع برنامه `python -m liara_agent web` می‌باشد. در تنظیمات متغیرهای محیطی برنامه در لیارا این متغیرها را با مقادیر محرمانه تنظیم کنید:
 
 - `LIARA_WEB_USERNAME`: نام کاربری دلخواه برای دسترسی به پنل وب.
 - `LIARA_WEB_PASSWORD`: رمز عبور قوی و منحصربه‌فرد.
