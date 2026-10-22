@@ -168,7 +168,7 @@ def _llm(msg, app, tools, st, url):
             model=model,
             messages=[{"role": "system", "content": SYSTEM}, *st["msgs"]],
             tools=spec,
-            max_tokens=1200,
+            max_completion_tokens=1200,
         )
         m = r.choices[0].message
         assistant_msg = m.model_dump(exclude_none=True)
@@ -210,5 +210,15 @@ def handle(msg, app, tools, st, url=""):
         try:
             return _llm(msg, app, tools, st, url)
         except Exception as e:
-            return [ev("step", text=f"هوش مصنوعی BoxAPI در دسترس نبود ({type(e).__name__}) — حالت ساده")] + _rules(msg, app, tools, st, url)
+            # جزئیات خطای API برای عیب‌یابی؛ کلیدها و توکن‌ها هرگز به UI فرستاده نمی‌شوند.
+            detail = str(getattr(e, "message", "") or e)
+            key = os.getenv("BOXAPI_API_KEY", "")
+            if key:
+                detail = detail.replace(key, "[REDACTED]")
+            detail = re.sub(r"(?i)(bearer\\s+)[^\\s,;]+", r"\\1[REDACTED]", detail)
+            detail = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "[REDACTED]", detail)
+            detail = re.sub(r"\\s+", " ", detail).strip()[:260]
+            status = getattr(e, "status_code", None)
+            tag = f"HTTP {status}: " if status else ""
+            return [ev("step", text=f"خطای BoxAPI ({type(e).__name__}) — {tag}{detail or 'جزئیات خطا موجود نیست'}؛ استفاده از حالت ساده")] + _rules(msg, app, tools, st, url)
     return _rules(msg, app, tools, st, url)
