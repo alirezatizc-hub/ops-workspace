@@ -55,7 +55,7 @@ class H(BaseHTTPRequestHandler):
         """اعتبارسنجی درخواست؛ حالت عمومی فقط با احراز هویت فعال می‌شود."""
         public = os.getenv("LIARA_PUBLIC", "").lower() in ("1", "true", "yes") or bool(os.getenv("PORT"))
         host = self.headers.get("Host", "")
-        if not host or any(ch in host for ch in "\\r\\n /\\\\"):
+        if not host or any(ch in host for ch in "\r\n /\\"):
             self._send({"error": "invalid host"}, 400); return False
         if not public:
             p = S["port"]
