@@ -154,7 +154,7 @@ dialog[open]{animation:in .3s both}
 const $=s=>document.querySelector(s), chat=$('#chat'), sleep=ms=>new Promise(r=>setTimeout(r,ms));
 let busy=false;
 const SES=document.querySelector('meta[name=session]').content;
-const api=async(p,b)=>{try{const r=await fetch(p,{method:b?'POST':'GET',headers:{'Content-Type':'application/json','X-Session':SES},body:b?JSON.stringify(b):undefined});return await r.json()}catch(e){return{error:'ارتباط با سرور برقرار نشد'}}};
+const api=async(p,b)=>{const ctl=new AbortController(),timer=setTimeout(()=>ctl.abort(),15000);try{const r=await fetch(p,{method:b?'POST':'GET',headers:{'Content-Type':'application/json','X-Session':SES},body:b?JSON.stringify(b):undefined,signal:ctl.signal,cache:'no-store'});let data;try{data=await r.json()}catch(_){data={error:'پاسخ سرور JSON معتبر نیست (HTTP '+r.status+')'}}if(!r.ok&&!data.error)data.error='خطای سرور (HTTP '+r.status+')';return data}catch(e){return{error:e.name==='AbortError'?'پاسخ سرور بیش از ۱۵ ثانیه طول کشید؛ لاگ استقرار لیارا را بررسی کن.':'ارتباط با سرور برقرار نشد: '+(e.message||'خطای شبکه')}}finally{clearTimeout(timer)}};
 const el=(t,c,txt)=>{const e=document.createElement(t);if(c)e.className=c;if(txt!=null)e.textContent=txt;return e};
 const add=n=>{chat.appendChild(n);chat.scrollTop=chat.scrollHeight;return n};
 const fa=n=>String(n).replace(/\d/g,d=>'۰۱۲۳۴۵۶۷۸۹'[d]);
