@@ -1,0 +1,9 @@
+{
+  "app": "liara-sre-agent",
+  "platform": "python",
+  "port": 8080,
+  "args": ["python3 -m liara_agent web"],
+  "python": {
+    "version": "3.12"
+  }
+}
