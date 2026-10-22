@@ -1,5 +1,5 @@
 """وب‌سرور محلی (stdlib). فقط 127.0.0.1؛ توکن نشست، بررسی Host/Origin، CSP، محدودیت اندازه و نرخ."""
-import hmac, json, os, secrets, threading, time
+import base64, hmac, json, os, secrets, threading, time
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -52,16 +52,46 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
 
     def _guard(self, api, post):
-        """False برمی‌گرداند و پاسخ خطا می‌فرستد اگر درخواست مجاز نباشد."""
-        p = S["port"]
-        if self.headers.get("Host", "") not in (f"127.0.0.1:{p}", f"localhost:{p}"):
-            self._send({"error": "host not allowed"}, 403); return False
+        """اعتبارسنجی درخواست؛ حالت عمومی فقط با احراز هویت فعال می‌شود."""
+        public = os.getenv("LIARA_PUBLIC", "").lower() in ("1", "true", "yes") or bool(os.getenv("PORT"))
+        host = self.headers.get("Host", "")
+        if not host or any(ch in host for ch in "\\r\\n /\\\\"):
+            self._send({"error": "invalid host"}, 400); return False
+        if not public:
+            p = S["port"]
+            if host not in (f"127.0.0.1:{p}", f"localhost:{p}"):
+                self._send({"error": "host not allowed"}, 403); return False
+        else:
+            username, password = os.getenv("LIARA_WEB_USERNAME", ""), os.getenv("LIARA_WEB_PASSWORD", "")
+            if not username or not password:
+                self._send({"error": "public mode requires LIARA_WEB_USERNAME and LIARA_WEB_PASSWORD"}, 503); return False
+            auth = self.headers.get("Authorization", "")
+            valid = False
+            if auth.startswith("Basic "):
+                try:
+                    raw = base64.b64decode(auth[6:], validate=True).decode("utf-8")
+                    supplied_user, supplied_password = raw.split(":", 1)
+                    valid = hmac.compare_digest(supplied_user, username) and hmac.compare_digest(supplied_password, password)
+                except (ValueError, UnicodeDecodeError):
+                    valid = False
+            if not valid:
+                self.send_response(401)
+                self.send_header("WWW-Authenticate", 'Basic realm="Liara SRE Agent", charset="UTF-8"')
+                self._hdrs("application/json")
+                body = b'{"error":"authentication required"}'
+                self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+                return False
         if api:
             if not hmac.compare_digest(self.headers.get("X-Session", ""), SESSION):
                 self._send({"error": "invalid session"}, 403); return False
             origin = self.headers.get("Origin")
-            if origin and origin not in (f"http://127.0.0.1:{p}", f"http://localhost:{p}"):
-                self._send({"error": "origin not allowed"}, 403); return False
+            if origin:
+                parsed = urlparse(origin)
+                if public:
+                    if parsed.scheme not in ("http", "https") or parsed.netloc != host:
+                        self._send({"error": "origin not allowed"}, 403); return False
+                elif origin not in (f"http://127.0.0.1:{S['port']}", f"http://localhost:{S['port']}"):
+                    self._send({"error": "origin not allowed"}, 403); return False
         if post and not self.headers.get("Content-Type", "").startswith("application/json"):
             self._send({"error": "content-type must be application/json"}, 415); return False
         return True
@@ -119,8 +149,13 @@ class H(BaseHTTPRequestHandler):
         self._send({"error": "not found"}, 404)
 
 
-def run(port=8080):
+def run(port=None):
+    public = os.getenv("LIARA_PUBLIC", "").lower() in ("1", "true", "yes") or bool(os.getenv("PORT"))
+    port = int(os.getenv("PORT") or os.getenv("LIARA_PORT") or port or 8080)
+    host = "0.0.0.0" if public else "127.0.0.1"
+    if public and (not os.getenv("LIARA_WEB_USERNAME") or not os.getenv("LIARA_WEB_PASSWORD")):
+        raise RuntimeError("برای اجرای عمومی، متغیرهای LIARA_WEB_USERNAME و LIARA_WEB_PASSWORD را در تنظیمات محیطی لیارا تنظیم کنید.")
     S["tools"], S["port"] = build_tools(make_client()), port
     audit.load()
-    print(f"🚀 http://127.0.0.1:{port}  (فقط محلی؛ Ctrl+C برای خروج)")
-    ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+    print(f"🚀 Liara SRE Agent listening on {host}:{port}")
+    ThreadingHTTPServer((host, port), H).serve_forever()
