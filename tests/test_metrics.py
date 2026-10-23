@@ -88,10 +88,48 @@ def _run(raw, tool):
 def test_get_metrics_tool_official_empty_and_invalid():
     r = _run(OFFICIAL, "get_metrics")
     assert r["status"] == "ok" and r["result"]["disk"] == 40.0 and r["result"]["latest"]["cpu"][0]["value"] == 0.25
-    assert "فرض تأییدنشده" in r["result"]["note"] and "استفاده نمی‌شود" in r["result"]["note"]
+    # این کلاینت تستی کاتالوگ پلن ندارد ← درصد ساخته نمی‌شود، ولی مقدار خام (بایت/هسته) داده می‌شود
+    assert r["result"]["cpu"] is None and r["result"]["memory"] is None
+    assert r["result"]["cpu_cores"] == 0.25 and r["result"]["memory_bytes"] == 300
+    assert "درصد ساخته نشد" in r["result"]["note"]
     for bad in ({}, None, {"cpuUsage": [{"value": [1, "NaN"]}]}):
         r = _run(bad, "get_metrics")
         assert r["status"] != "ok"                                                   # خطای قابل‌فهم، نه عدد ساختگی
+
+
+def test_official_metrics_become_percent_with_plan_limits():
+    """واحد قالب رسمی (مشاهده‌ی رفتاری API): RAM=بایت، CPU=هسته؛ درصد نسبت به سقف پلن /v1/me."""
+    from liara_agent.diagnose import metrics_detail, parse_series
+    raw = {"cpuUsage": [{"applet": "a", "value": [1, "0.25"]}, {"applet": "b", "value": [1, "0.25"]}],
+           "memoryUsage": [{"applet": "a", "value": [1, str(256 * 1024 * 1024)]}],
+           "disksUsage": [{"name": "d", "size": "100", "usage": "40"}]}
+    d = metrics_detail(raw, {"ram_mb": 512, "cpu": 1})
+    assert d["cpu_cores"] == 0.5 and d["cpu"] == 50.0                 # مجموع اپلت‌ها: ۰٫۵ از ۱ هسته
+    assert d["memory_bytes"] == 256 * 1024 * 1024 and d["memory"] == 50.0
+    assert d["disk"] == 40.0
+    assert analyze({"project_id": "x", "status": "ACTIVE", "scale": 1}, raw, {"logs": []}, "", {"ram_mb": 512, "cpu": 1}) == []
+    hot = {"memoryUsage": [{"value": [1, str(int(0.97 * 512 * 1024 * 1024))]}], "cpuUsage": [{"value": [1, "0.1"]}]}
+    fs = analyze({"project_id": "x", "status": "ACTIVE", "scale": 1}, hot, {"logs": []}, "", {"ram_mb": 512, "cpu": 1})
+    assert fs and "حافظه" in fs[0].cause                              # حالا با پلن، مصرف بالای RAM دیده می‌شود
+    assert parse_series({"result": [{"applet": "a", "values": [[1, "2"], [2, "3"]]},
+                                    {"applet": "b", "values": [[1, "1"], [2, "bad"]]}]}) == [(1.0, 3.0), (2.0, 3.0)]
+
+
+def test_app_state_recognizes_real_liara_statuses():
+    """رفع باگ اسکرین‌شات کاربر: لیارا برای اپ سالم ACTIVE برمی‌گرداند و قبلاً «در حال اجرا نیست» می‌زدیم."""
+    from liara_agent import insights
+    from liara_agent.diagnose import app_state
+    assert app_state({"status": "ACTIVE", "scale": 1}) == "running"
+    assert app_state({"status": "RUNNING", "scale": 1}) == "running"
+    assert app_state({"status": "ACTIVE", "scale": 0}) == "off"
+    assert app_state({"status": "STOPPED", "scale": 1}) == "off"
+    assert app_state({"status": "CRASHED", "scale": 1}) == "error"
+    assert app_state({"status": "BUILDING", "scale": 1}) == "busy"
+    assert app_state({"status": "SOME-NEW-STATE", "scale": 1, "isDeployed": True}) == "running"   # ناشناخته ← خاموش فرض نشود
+    s, why = insights.health_score({"status": "ACTIVE", "scale": 1, "isDeployed": True},
+                                   {"cpu": None, "memory": None, "disk": None}, None)
+    assert s == 100 and why == []
+    assert all(a["key"] != "down" for a in insights.alerts({"status": "ACTIVE", "scale": 1}, {}, None))
 
 
 def test_diagnose_reports_metrics_source_honestly():

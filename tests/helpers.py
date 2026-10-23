@@ -81,11 +81,42 @@ class FakeLiara:
                     return self._j(200, {"cpuUsage": [{"applet": "a", "value": [1700000000, "0.2"]}],
                                          "memoryUsage": [{"applet": "a", "value": [1700000000, "1000"]}],
                                          "disksUsage": [{"name": "d", "size": "100", "usage": "50", "reportedAt": "x"}]})
-                if self.command == "POST" and p in ("/v1/projects/my-shop/actions/restart", "/v1/projects/my-shop/resize"):
+                if self.command == "POST" and p in ("/v1/projects/my-shop/actions/restart", "/v1/projects/my-shop/resize",
+                                                     "/v1/projects/my-shop/actions/scale", "/v1/projects/update-envs"):
                     return self._j(200, {})
+                if self.command == "GET" and p == "/v1/me":
+                    plan = lambda cpu, ram, price: {"CPU": {"amount": cpu}, "RAM": {"amount": ram},
+                                                    "volume": 5, "price": price, "available": True, "region": "iran"}
+                    return self._j(200, {"user": {"fullname": "تستر", "email": "t@e.ir"},
+                                         "plans": {"projects": {"p1": plan(0.5, 0.5, 100), "p2": plan(1, 1, 200)},
+                                                   "databases": {"dbp1": plan(0.5, 0.5, 120)}},
+                                         "defaultDatabaseVersions": {"mysql": "8.0"}, "databaseVersions": {}})
+                if p == "/v1/databases" and self.command == "GET":
+                    return self._j(200, {"databases": [{"id": "db1", "DBId": "db1", "hostname": "shop-db", "type": "mysql",
+                                                        "status": "ACTIVE", "scale": 1, "planID": "dbp1"}]})
+                if p == "/v1/databases" and self.command == "POST":
+                    return self._j(200, {"databaseID": "db-new"})
+                if p == "/v1/databases/db1" and self.command == "GET":
+                    return self._j(200, {"database": {"id": "db1", "hostname": "shop-db", "type": "mysql", "status": "ACTIVE",
+                                                      "scale": 1, "planID": "dbp1", "root_password": "FAKE-SECRET",
+                                                      "username": "root", "dbName": "shop", "port": 3306,
+                                                      "node": {"_id": "n", "host": "shop-db.liara"}}})
+                if p.startswith("/v1/databases/") and self.command in ("POST", "PATCH", "DELETE"):
+                    if p.endswith("/backups") and self.command == "GET":  # noqa
+                        pass
+                    return self._j(200, {"link": "https://example.invalid/x"} if p.endswith("/download") else {})
+                if p == "/v1/databases/db1/backups" and self.command == "GET":
+                    return self._j(200, {"backups": [{"name": "b1.gz", "size": 10}]})
+                if p == "/v1/domains":
+                    if self.command == "GET":
+                        return self._j(200, {"domains": [{"_id": "dom1", "name": "shop.ir", "status": "ACTIVE",
+                                                          "certificatesStatus": "ISSUED", "project": {"project_id": "my-shop"}}]})
+                    return self._j(201, {"domain": {"_id": "dom2"}})
+                if p.startswith("/v1/domains/") and self.command in ("POST", "GET", "DELETE"):
+                    return self._j(200, {"verified": True} if p.endswith("/check") else {"code": "OK"})
                 self._j(404, {"message": "not found"})
 
-            do_GET = do_POST = _do
+            do_GET = do_POST = do_DELETE = do_PATCH = _do
 
             def _j(self, code, obj):
                 b = json.dumps(obj).encode()

@@ -122,10 +122,23 @@ def test_web_end_to_end_mock():
     assert prog["simulated"] and prog["stages"][0]["state"] == "ok"
     bad = req(srv, "POST", "/api/chat", {"message": "https://evil.com/x/y.git را دیپلوی کن", "app": "my-shop"})[2]["events"]
     assert not any(e["type"] == "confirm" for e in bad)
-    d = req(srv, "POST", "/api/chat", {"message": "دامنه shop.ir را وصل کن", "app": "my-shop"})[2]["events"]
-    assert any(e["type"] == "guide" and "ایرنیک" in " ".join(e["items"]) for e in d)
+    d = req(srv, "POST", "/api/chat", {"message": "دامنه newshop.ir را وصل کن", "app": "my-shop"})[2]["events"]
+    dc = next(e for e in d if e["type"] == "confirm")                       # وصل‌کردن دامنه = اقدام واقعی با تأیید
+    req(srv, "POST", "/api/confirm", {"id": dc["id"], "approve": True})
+    ov = req(srv, "GET", "/api/overview")[2]
+    assert any(x["name"] == "newshop.ir" for x in ov["domains"]) and any(x["hostname"] == "shop-db" for x in ov["databases"])
+    g2 = req(srv, "POST", "/api/chat", {"message": "چطور دامنه را وصل کنم؟ ایرنیک", "app": "my-shop"})[2]["events"]
+    assert any(e["type"] == "guide" and "ایرنیک" in " ".join(e["items"]) for e in g2)
+    # خاموش/روشن کردن دیتابیس از چت (خواسته‌ی اصلی کاربر)
+    db = req(srv, "POST", "/api/chat", {"message": "دیتابیس shop-db را خاموش کن", "app": "my-shop"})[2]["events"]
+    dbc = next(e for e in db if e["type"] == "confirm")
+    req(srv, "POST", "/api/confirm", {"id": dbc["id"], "approve": True})
+    ov = req(srv, "GET", "/api/overview")[2]
+    assert next(x for x in ov["databases"] if x["hostname"] == "shop-db")["state"] == "off"
     au = req(srv, "GET", "/api/audit")[2]["entries"]
-    assert au[0]["tool"] == "deploy_repo" and any(a["tool"] == "resize_app" for a in au)
+    assert au[0]["tool"] == "turn_database_off"
+    assert any(a["tool"] == "deploy_repo" for a in au) and any(a["tool"] == "resize_app" for a in au)
+    assert any(a["tool"] == "diagnose_app" and a["decision"] == "مشاهده" for a in au)   # تاریخچه برای مشاهده‌ها هم پر می‌شود
     # URL داخلی در پنل پایش: خطا نه درخواست
     hs = req(srv, "GET", "/api/status?name=my-shop&url=http://169.254.169.254/")[2]
     assert hs["health"]["ok"] is False

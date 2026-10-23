@@ -3,6 +3,47 @@ import math, re
 from dataclasses import dataclass, field
 
 
+# ---------------- وضعیت اجرا ----------------
+# نکته‌ی مهم: API واقعی لیارا برای اپ سالم status="ACTIVE" برمی‌گرداند (نه RUNNING).
+# قبلاً فقط «run» جستجو می‌شد و اپ سالم «در حال اجرا نیست» گزارش می‌شد. حالا سه‌حالته‌ایم:
+# running/off/error/busy/unknown و مقیاس (scale) هم لحاظ می‌شود؛ وضعیت ناشناخته «خاموش» فرض نمی‌شود.
+_RUNNING = ("RUNNING", "ACTIVE", "READY", "ONLINE", "HEALTHY", "STARTED", "LIVE")
+_BUSY = ("BUILD", "DEPLOY", "PENDING", "QUEUED", "STARTING", "RESTART", "UPDAT", "PROVISION", "CREAT")
+_ERROR = ("CRASH", "ERROR", "FAIL", "UNHEALTHY", "EXITED", "DEGRADED")
+_OFF = ("STOP", "OFF", "INACTIVE", "DOWN", "PAUSED", "SUSPEND", "TERMINAT")
+
+STATE_FA = {"running": "در حال اجرا", "off": "خاموش", "error": "خطادار",
+            "busy": "در حال دیپلوی/راه‌اندازی", "unknown": "نامشخص"}
+
+
+def app_state(p) -> str:
+    """وضعیت یکدست‌شده‌ی اپ/دیتابیس از روی {status, scale, isDeployed} پاسخ لیارا."""
+    if not isinstance(p, dict):
+        return "unknown"
+    scale = p.get("scale")
+    s = str(p.get("status", "")).upper()
+    if any(w in s for w in _ERROR):
+        return "error"
+    if isinstance(scale, (int, float)) and not isinstance(scale, bool) and scale == 0:
+        return "off"
+    if any(w in s for w in _BUSY):
+        return "busy"
+    if any(w in s for w in _RUNNING) or s == "UP":
+        return "running"
+    if any(w in s for w in _OFF):
+        return "off"
+    # status ناشناخته: اگر مقیاس ≥۱ و دیپلوی شده، محتمل‌ترین برداشت «در حال اجرا»ست؛ خاموش فرض نکن.
+    if isinstance(scale, (int, float)) and scale >= 1 and p.get("isDeployed", True):
+        return "running"
+    return "unknown"
+
+
+def state_fa(p) -> str:
+    st = app_state(p)
+    raw = str(p.get("status", "")) if isinstance(p, dict) else ""
+    return STATE_FA[st] + (f" ({raw})" if st == "unknown" and raw else "")
+
+
 @dataclass
 class Finding:
     cause: str
@@ -119,13 +160,61 @@ def parse_metrics_summary(raw) -> dict:
     return r
 
 
-def normalize_metrics(raw) -> dict:
-    """خروجی ثابت {cpu, memory, disk} بر حسب درصد یا None.
-    در قالب رسمی فقط دیسک درصد می‌شود (usage/size)؛ واحد CPU/RAM در spec مشخص نیست و تبدیل نمی‌شود."""
+def _sum_latest(series):
+    """مجموع تازه‌ترین مقدار هر اپلت (در قالب رسمی هر اپلت یک رکورد جدا دارد)."""
+    vals = [s["value"] for s in series]
+    return sum(vals) if vals else None
+
+
+def metrics_detail(raw, limits=None) -> dict:
+    """جزئیات کامل متریک + درصدها. در قالب رسمی: memoryUsage=بایت، cpuUsage=هسته (مشاهده‌ی رفتاری API).
+    درصد فقط وقتی ساخته می‌شود که سقف پلن معلوم باشد: limits={"ram_mb":..., "cpu":...} از کاتالوگ /v1/me.
+    بدون limits، درصد CPU/RAM ‏None می‌ماند و مقدار خامِ خوانا برگردانده می‌شود (هرگز حدس زده نمی‌شود)."""
     p = parse_metrics_summary(raw)
+    out = {"cpu": None, "memory": None, "disk": None, "cpu_cores": None, "memory_bytes": None,
+           "limits": dict(limits or {}), "usable": p["usable"], "format": p["format"], "issues": p["issues"]}
     if p["format"] == "official":
-        return {"cpu": None, "memory": None, "disk": max((d["percent"] for d in p["disks"]), default=None)}
-    return {"cpu": p["legacy"].get("cpu"), "memory": p["legacy"].get("memory"), "disk": p["legacy"].get("disk")}
+        out["cpu_cores"] = _sum_latest(p["cpu"])
+        out["memory_bytes"] = _sum_latest(p["memory"])
+        out["disk"] = max((d["percent"] for d in p["disks"]), default=None)
+        ram_mb = (limits or {}).get("ram_mb")
+        cpu_cap = (limits or {}).get("cpu")
+        if out["memory_bytes"] is not None and ram_mb:
+            out["memory"] = min(out["memory_bytes"] / (ram_mb * 1024 * 1024) * 100, 100.0)
+        if out["cpu_cores"] is not None and cpu_cap:
+            # اگر مقدار از چند برابر ظرفیت پلن هم بزرگ‌تر بود، احتمالاً خودش درصد است نه هسته.
+            out["cpu"] = min(out["cpu_cores"] / cpu_cap * 100, 100.0) if out["cpu_cores"] <= cpu_cap * 8 else min(out["cpu_cores"], 100.0)
+    else:
+        out.update({"cpu": p["legacy"].get("cpu"), "memory": p["legacy"].get("memory"), "disk": p["legacy"].get("disk")})
+    return out
+
+
+def normalize_metrics(raw, limits=None) -> dict:
+    """خروجی ثابت {cpu, memory, disk} بر حسب درصد یا None (با سقف پلن، از قالب رسمی هم درصد درمی‌آید)."""
+    d = metrics_detail(raw, limits)
+    return {"cpu": d["cpu"], "memory": d["memory"], "disk": d["disk"]}
+
+
+def parse_series(raw) -> list:
+    """پاسخ /metrics/{kind}: ‏{result:[{applet, values:[[ts, "v"], ...]}]} ← نقاط (ts, مجموع اپلت‌ها) مرتب‌شده."""
+    res = raw.get("result", []) if isinstance(raw, dict) else []
+    by_t = {}
+    for series in res if isinstance(res, list) else []:
+        for point in (series.get("values") or []) if isinstance(series, dict) else []:
+            if isinstance(point, (list, tuple)) and len(point) == 2:
+                t, v = _num(point[0]), _num(point[1])
+                if t is not None and v is not None:
+                    by_t[t] = by_t.get(t, 0.0) + v
+    return sorted(by_t.items())
+
+
+def fmt_bytes(n) -> str:
+    if n is None:
+        return "نامشخص"
+    for unit, div in (("گیگابایت", 1024 ** 3), ("مگابایت", 1024 ** 2), ("کیلوبایت", 1024)):
+        if n >= div:
+            return f"{n / div:.0f} {unit}" if n / div >= 10 else f"{n / div:.1f} {unit}"
+    return f"{n:.0f} بایت"
 
 
 def logs_to_lines(raw) -> list:
@@ -165,9 +254,17 @@ def next_plan_from_catalog(catalog, current):
 NO_PLAN_HINT = " (شناسه‌ی پلن‌ها از API تأییدشده در دسترس نیست؛ پلن را از پنل لیارا انتخاب کنید.)"
 
 
-def analyze(project: dict, metrics_raw, logs_raw, next_plan="") -> list:
-    met, lines = normalize_metrics(metrics_raw), logs_to_lines(logs_raw)
+def analyze(project: dict, metrics_raw, logs_raw, next_plan="", limits=None) -> list:
+    met, lines = normalize_metrics(metrics_raw, limits), logs_to_lines(logs_raw)
     text, findings = "\n".join(lines), []
+    st = app_state(project)
+    if st == "off":
+        findings.append(Finding("اپ خاموش است", 0.95, [f"scale={project.get('scale')}"],
+                                "اپ را روشن کنید (می‌توانم با تأیید شما روشنش کنم).",
+                                fix_tool="turn_app_on", fix_args={"name": project.get("project_id", "")}))
+    elif st == "error":
+        findings.append(Finding("اپ در وضعیت خطاست", 0.85, [f"status={project.get('status')}"],
+                                "آخرین لاگ‌ها و رویدادهای اپ را بررسی کنید؛ ری‌استارت موقتاً کمک می‌کند."))
     for cause, pat, metric, thr, sug in RULES:
         hits = [l for l in lines if re.search(pat, l, re.I)]
         high = metric and met.get(metric) is not None and met[metric] >= thr

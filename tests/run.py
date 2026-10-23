@@ -4,7 +4,7 @@ sys.path.insert(0, os.path.dirname(__file__)); sys.path.insert(0, os.path.join(o
 if os.path.exists("/tmp/liara_test_audit.jsonl"):
     os.remove("/tmp/liara_test_audit.jsonl")
 fails = n = 0
-for mod in ("test_core", "test_client", "test_security", "test_metrics"):
+for mod in ("test_core", "test_client", "test_security", "test_metrics", "test_panel"):
     m = importlib.import_module(mod)
     for name in sorted(x for x in dir(m) if x.startswith("test_")):
         n += 1

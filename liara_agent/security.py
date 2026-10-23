@@ -7,6 +7,7 @@ class ValidationError(ValueError):
 
 
 APP_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 PLAN_RE = re.compile(r"^[A-Za-z0-9._-]{1,40}$")
 PLATFORM_RE = re.compile(r"^[a-z0-9-]{2,24}$")
@@ -19,6 +20,13 @@ def validate_app_name(n):
     if not isinstance(n, str) or not APP_RE.match(n):
         raise ValidationError("نام اپ نامعتبر است (فقط حروف کوچک انگلیسی، عدد و خط تیره)")
     return n
+
+
+def validate_id(v):
+    """شناسه‌ی منابع لیارا (ObjectId/نام دیسک/نام فایل بکاپ/شناسه‌ی دامنه): فقط برای جلوگیری از دستکاری مسیر."""
+    if not isinstance(v, str) or not ID_RE.match(v) or ".." in v:
+        raise ValidationError("شناسه‌ی منبع نامعتبر است")
+    return v
 
 
 def validate_env(key, value):
