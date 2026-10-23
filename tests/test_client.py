@@ -31,22 +31,62 @@ def test_logs_sends_required_since_and_team_id():
 
 def test_unverified_endpoints_disabled_by_default():
     f = FakeLiara(); c = _c(f)
-    for fn in (lambda: c.plans(), lambda: c.set_envs("my-shop", {"A": "1"})):
-        try:
-            fn(); assert False
-        except LiaraAPIError as e:
-            assert e.status == 501 and e.unsupported
+    try:
+        c.networks(); assert False
+    except LiaraAPIError as e:
+        assert e.status == 501 and e.unsupported
     assert f.calls == []                                      # حتی یک درخواست هم ارسال نشد
     os.environ["LIARA_ALLOW_UNVERIFIED"] = "1"
     try:
         try:
-            c.set_envs("my-shop", {"A": "1"})
+            c.networks()
         except LiaraAPIError:
             pass
-        assert f.calls[-1]["path"] == "/v1/projects/update-envs"
-        assert f.calls[-1]["body"] == {"project": "my-shop", "variables": [{"key": "A", "value": "1"}]}   # بدنه‌ی رسمی
+        assert f.calls and f.calls[-1]["path"].startswith("/v1/networks")
     finally:
         os.environ.pop("LIARA_ALLOW_UNVERIFIED")
+    f.stop()
+
+
+def test_update_envs_is_official_with_official_body():
+    f = FakeLiara(); c = _c(f)
+    c.set_envs("my-shop", {"A": "1", "B": "2"})
+    assert f.calls[-1]["path"].split("?")[0] == "/v1/projects/update-envs"
+    assert f.calls[-1]["body"] == {"project": "my-shop",
+                                   "variables": [{"key": "A", "value": "1"}, {"key": "B", "value": "2"}]}   # بدنه‌ی رسمی
+    f.stop()
+
+
+def test_plans_come_from_me_catalog():
+    f = FakeLiara(); c = _c(f)
+    plans = c.plans()["plans"]
+    assert [p["id"] for p in plans] == ["p1", "p2"]                       # مرتب بر اساس قیمت
+    assert plans[0]["ram_mb"] == 512 and plans[0]["cpu"] == 0.5           # گیگابایت←مگابایت، هسته
+    assert f.calls[0]["path"].split("?")[0] == "/v1/me"
+    c.plans()                                                              # کش: درخواست دوباره نمی‌رود
+    assert len([x for x in f.calls if x["path"].startswith("/v1/me")]) == 1
+    f.stop()
+
+
+def test_database_and_domain_endpoints_contract():
+    f = FakeLiara(); c = _c(f)
+    assert c.list_databases()[0]["hostname"] == "shop-db"
+    assert c.get_database("db1")["root_password"] == "FAKE-SECRET"        # خام در کلاینت؛ پاک‌سازی وظیفه‌ی tools است
+    c.scale_database("db1", False)
+    sc = [x for x in f.calls if x["path"].split("?")[0] == "/v1/databases/db1/actions/scale"][0]
+    assert sc["m"] == "POST" and sc["body"] == {"scale": 0}
+    c.db_public_network("db1", True)
+    pn = f.calls[-1]
+    assert pn["m"] == "PATCH" and pn["path"].split("?")[0] == "/v1/databases/db1/public-network/enable"
+    assert c.download_db_backup("db1", "b1.gz")["link"].startswith("https://")
+    assert c.list_domains()[0]["name"] == "shop.ir"
+    c.enable_ssl("shop.ir")
+    assert f.calls[-1]["body"] == {"domain": "shop.ir"}
+    c.create_database("new-db", "mysql", "dbp1", "8.0")
+    assert f.calls[-1]["body"] == {"hostname": "new-db", "type": "mysql", "planID": "dbp1",
+                                   "publicNetwork": False, "version": "8.0"}
+    c.scale("my-shop", False)
+    assert f.calls[-1]["body"] == {"scale": 0}
     f.stop()
 
 

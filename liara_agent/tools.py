@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Callable
 from . import security as sec
 from .client import LiaraAPIError
-from .diagnose import analyze, logs_to_lines, next_plan_from_catalog, normalize_metrics, parse_metrics_summary
+from .diagnose import (analyze, app_state, fmt_bytes, logs_to_lines, metrics_detail,
+                       next_plan_from_catalog, normalize_metrics, parse_metrics_summary, parse_series, state_fa)
 from .security import ValidationError
 
 SECRET = re.compile(r"KEY|SECRET|TOKEN|PASS|URL", re.I)
@@ -74,34 +75,110 @@ def _recommend(kind, traffic="low", has_db=False):
 
 
 def _running(p):
-    return bool(re.search("run", str(p.get("status", "")), re.I))
+    return app_state(p) == "running"
+
+
+DB_SECRET_KEYS = ("root_password", "password", "rootPassword", "pass", "secret")
+DB_TYPES = ("mysql", "mariadb", "postgres", "postgresql", "mongodb", "mongo", "redis", "mssql", "elasticsearch")
+
+
+def _catalog(c):
+    """کاتالوگ پلن‌ها از کلاینت (LiaraClient/Mock)؛ اگر کلاینت پشتیبانی نکند، خالی."""
+    fn = getattr(c, "catalog", None)
+    if fn is None:
+        return {"projects": [], "databases": [], "database_versions": {}, "default_database_versions": {}}
+    return fn()
+
+
+def _limits_for(c, plan_id, group="projects"):
+    """سقف منابع یک پلن از کاتالوگ: {"ram_mb":..., "cpu":...} یا None (درصد ساخته نمی‌شود)."""
+    try:
+        for p in _catalog(c).get(group, []):
+            if p.get("id") == plan_id and (p.get("ram_mb") or p.get("cpu")):
+                return {"ram_mb": p.get("ram_mb"), "cpu": p.get("cpu")}
+    except Exception:
+        pass
+    return None
+
+
+def _safe_db(db):
+    """حذف رمزها از رکورد دیتابیس قبل از نمایش/دادن به LLM."""
+    if not isinstance(db, dict):
+        return db
+    out = {k: v for k, v in db.items() if k not in DB_SECRET_KEYS}
+    out["state"], out["state_fa"] = app_state(db), state_fa(db)
+    return out
 
 
 def build_tools(c):
     def list_apps():
-        return [{k: p.get(k) for k in ("project_id", "status", "type", "planID")} for p in c.list_projects() if isinstance(p, dict)]
+        out = []
+        for p in c.list_projects():
+            if isinstance(p, dict):
+                d = {k: p.get(k) for k in ("project_id", "status", "type", "planID", "scale")}
+                d["state"], d["state_fa"] = app_state(p), state_fa(p)
+                out.append(d)
+        return out
 
     def app_status(name):
         p = c.get_project(sec.validate_app_name(name))
-        return {k: p.get(k) for k in ("project_id", "status", "planID", "type", "scale", "isDeployed", "defaultSubdomain")}
+        out = {k: p.get(k) for k in ("project_id", "status", "planID", "type", "scale", "isDeployed",
+                                     "defaultSubdomain", "zeroDowntime", "created_at", "hourlyPrice")}
+        out["state"], out["state_fa"] = app_state(p), state_fa(p)
+        out["url"] = f"https://{name}.liara.run" if p.get("defaultSubdomain") else ""
+        return out
 
     def metrics(name, period="1h"):
-        raw = c.metrics(sec.validate_app_name(name), period)
-        p, m = parse_metrics_summary(raw), normalize_metrics(raw)
+        name = sec.validate_app_name(name)
+        raw = c.metrics(name, period)
+        p = parse_metrics_summary(raw)
         if not p["usable"]:
             raise LiaraAPIError(502, "داده‌ی متریک خالی/نامعتبر بود: " + "؛ ".join(p["issues"][:3]))
-        out = dict(m)
+        limits = None
+        try:
+            limits = _limits_for(c, c.get_project(name).get("planID", ""))
+        except Exception:
+            pass
+        d = metrics_detail(raw, limits)
+        out = {"cpu": d["cpu"], "memory": d["memory"], "disk": d["disk"],
+               "cpu_cores": d["cpu_cores"], "memory_bytes": d["memory_bytes"],
+               "memory_human": fmt_bytes(d["memory_bytes"]), "limits": d["limits"]}
         if p["format"] == "official":
             out["latest"] = {"cpu": p["cpu"], "memory": p["memory"], "disks": p["disks"]}
-            out["note"] = ("فرض تأییدنشده: value = [timestamp, value]؛ واحد CPU/RAM در spec رسمی مشخص نیست، "
-                       "پس به درصد تبدیل نشد و در تحلیل مصرف بالا استفاده نمی‌شود (مقدار خام در latest)")
+            out["note"] = ("واحد قالب رسمی: RAM=بایت، CPU=هسته. " +
+                           ("درصدها نسبت به سقف پلن از کاتالوگ /v1/me محاسبه شده‌اند." if limits
+                            else "پلن در کاتالوگ پیدا نشد؛ درصد ساخته نشد و فقط مقدار خام داده شد."))
         if p["issues"]:
             out["issues"] = p["issues"]
         return out
 
+    def metric_history(name, minutes=60):
+        """سری زمانی CPU/RAM از API (برای نمودار)؛ تبدیل به درصد فقط با سقف پلن."""
+        name = sec.validate_app_name(name)
+        since = int(time.time()) - max(5, min(int(minutes), 1440)) * 60
+        limits = None
+        try:
+            limits = _limits_for(c, c.get_project(name).get("planID", ""))
+        except Exception:
+            pass
+        cpu_pts = dict(parse_series(c.metric_series(name, "cpu", since))) if hasattr(c, "metric_series") else {}
+        mem_pts = dict(parse_series(c.metric_series(name, "memory", since))) if hasattr(c, "metric_series") else {}
+        cpu_cap, ram_mb = (limits or {}).get("cpu"), (limits or {}).get("ram_mb")
+        def pct_cpu(v):
+            return None if v is None or not cpu_cap else min(v / cpu_cap * 100 if v <= cpu_cap * 8 else v, 100.0)
+        def pct_mem(v):
+            return None if v is None or not ram_mb else min(v / (ram_mb * 1024 * 1024) * 100, 100.0)
+        ts = sorted(set(cpu_pts) | set(mem_pts))
+        points = [{"t": time.strftime("%H:%M", time.localtime(t)), "cpu": pct_cpu(cpu_pts.get(t)), "memory": pct_mem(mem_pts.get(t))} for t in ts]
+        step = max(1, len(points) // 60)
+        return {"points": points[::step][-60:], "limits": limits or {},
+                "note": "" if limits else "سقف پلن معلوم نیست؛ نمودار درصد ندارد."}
+
     def logs(name, lines=40):
         n = max(1, min(int(lines), 200))
-        return logs_to_lines(c.logs(sec.validate_app_name(name)))[-n:]
+        # خط‌های اطلاع‌رسانی خودِ ابزار لیارا (مثل هشدار آپگرید CLI) لاگ برنامه نیستند؛ نمایششان نده.
+        noise = re.compile(r"please upgrade your client|a new version of.*liara|liara.*update available", re.I)
+        return [l for l in logs_to_lines(c.logs(sec.validate_app_name(name))) if not noise.search(l)][-n:]
 
     def diagnose(name):
         sec.validate_app_name(name)
@@ -119,31 +196,64 @@ def build_tools(c):
         except LiaraAPIError as e:
             sources["logs"] = "unavailable: " + e.message[:120]
         cur = p.get("planID", "")
+        limits = _limits_for(c, cur)
 
         def nxt():
             try:
                 return next_plan_from_catalog(c.plans(), cur)
             except LiaraAPIError:
                 return ""
-        fs = analyze({**p, "project_id": name}, m_raw, l_raw, nxt)
-        return {"status": p.get("status"), "plan": cur, "scale": p.get("scale"), "isDeployed": p.get("isDeployed"),
-                "metrics": normalize_metrics(m_raw), "sources": sources, "findings": [f.__dict__ for f in fs]}
+        fs = analyze({**p, "project_id": name}, m_raw, l_raw, nxt, limits)
+        det = metrics_detail(m_raw, limits)
+        return {"status": p.get("status"), "state": app_state(p), "state_fa": state_fa(p),
+                "plan": cur, "scale": p.get("scale"), "isDeployed": p.get("isDeployed"),
+                "metrics": normalize_metrics(m_raw, limits),
+                "metrics_detail": {"cpu_cores": det["cpu_cores"], "memory_bytes": det["memory_bytes"],
+                                   "memory_human": fmt_bytes(det["memory_bytes"]), "limits": det["limits"]},
+                "sources": sources, "findings": [f.__dict__ for f in fs]}
 
     def env_vars(name):      # فقط نام‌ها؛ مقادیر هرگز نمایش داده نمی‌شوند
         return {e.get("key"): "***" for e in c.get_project(sec.validate_app_name(name)).get("envs", []) if isinstance(e, dict)}
+
+    def _current_envs(name):
+        envs = {}
+        for e in c.get_project(name).get("envs", []) or []:
+            if isinstance(e, dict) and e.get("key"):
+                envs[str(e["key"])] = "" if e.get("value") is None else str(e["value"])
+        return envs
 
     def health(url):
         return sec.safe_http_check(url)
 
     def restart(name): return c.restart(sec.validate_app_name(name))
 
+    def scale_app(name, on=True):
+        return c.scale(sec.validate_app_name(name), bool(on))
+
     def resize(name, plan): return c.resize(sec.validate_app_name(name), sec.validate_plan(plan))
 
     def set_env(name, key, value):
-        sec.validate_env(key, value)
-        return c.set_envs(sec.validate_app_name(name), {key: value})
+        # updateEnvs در لیارا «جایگزینی کامل» است: اول همه‌ی متغیرهای فعلی خوانده و merge می‌شوند
+        # تا متغیرهای دیگر پاک نشوند.
+        sec.validate_app_name(name); sec.validate_env(key, value)
+        envs = _current_envs(name)
+        envs[key] = value
+        c.set_envs(name, envs)
+        return {"ok": True, "key": key, "total_envs": len(envs), "note": "همه‌ی متغیرها (با مقدار جدید) دوباره ثبت شدند؛ اپ ری‌استارت می‌شود."}
 
-    def plans(): return c.plans()
+    def delete_env(name, key):
+        sec.validate_app_name(name); sec.validate_env(key, "")
+        envs = _current_envs(name)
+        if key not in envs:
+            raise LiaraAPIError(404, f"متغیر «{key}» روی اپ «{name}» وجود ندارد")
+        del envs[key]
+        c.set_envs(name, envs)
+        return {"ok": True, "key": key, "total_envs": len(envs)}
+
+    def plans(kind="apps"):
+        if kind == "databases":
+            return {"plans": _catalog(c)["databases"]}
+        return c.plans()
 
     def recommend(kind, traffic="low", has_db=False): return _recommend(kind, traffic, bool(has_db))
 
@@ -250,6 +360,286 @@ def build_tools(c):
     def deploy_app(name, platform, port=3000, path=".", health_url=""):
         return deploy(name, platform, port, str(_inside_root(path)), health_url)
 
+    # ================= کنترل کامل اپ =================
+    def turn_app_on(name): return scale_app(name, True)
+    def turn_app_off(name): return scale_app(name, False)
+
+    def create_app(name, platform, plan="", network=""):
+        sec.validate_app_name(name); sec.validate_platform(platform)
+        if not plan:
+            avail = [p for p in _catalog(c)["projects"] if p.get("available")]
+            if not avail:
+                raise LiaraAPIError(502, "کاتالوگ پلن‌های اپ از API برنگشت؛ plan را صریح بدهید")
+            plan = avail[0]["id"]
+        sec.validate_plan(plan)
+        if not network:      # شبکه‌ی خصوصی پیش‌فرض (اگر مسیرش فعال باشد)؛ خطا مانع ساخت نمی‌شود
+            try:
+                nets = c.networks()
+                if nets:
+                    network = str(nets[0].get("name") or nets[0].get("_id") or "")
+            except Exception:
+                network = ""
+        r = c.create_project(name, platform, plan, network)
+        return {"ok": True, "name": name, "platform": platform, "plan": plan,
+                "note": "اپ ساخته شد؛ حالا می‌توانید رویش دیپلوی کنید.", "raw": r if isinstance(r, dict) else {}}
+
+    def delete_app(name):
+        c.delete_project(sec.validate_app_name(name))
+        return {"ok": True, "deleted": name}
+
+    def _as_list(d, *keys, limit=30):
+        if isinstance(d, list):
+            items = d
+        elif isinstance(d, dict):
+            items = next((d[k] for k in keys if isinstance(d.get(k), list)), [])
+        else:
+            items = []
+        return items[-limit:] if len(items) > limit else items
+
+    def app_events(name):
+        return {"events": _as_list(c.events(sec.validate_app_name(name)), "events")}
+
+    def app_releases(name):
+        d = c.releases(sec.validate_app_name(name))
+        return {"total": d.get("total") if isinstance(d, dict) else None,
+                "current": d.get("currentRelease") if isinstance(d, dict) else None,
+                "releases": _as_list(d, "releases")}
+
+    TOGGLES = {"zero_downtime": "zero-downtime", "default_subdomain": "default-subdomain",
+               "fixed_ip": "fixed-ip", "read_only": "read-only"}
+
+    def app_setting(name, setting, on=True):
+        sec.validate_app_name(name)
+        feature = TOGGLES.get(str(setting).replace("-", "_"))
+        if not feature:
+            raise LiaraAPIError(400, "تنظیم مجاز: " + "، ".join(TOGGLES))
+        proj = c.get_project(name)
+        if not (proj.get("_id") or proj.get("id")):
+            raise LiaraAPIError(502, "شناسه‌ی داخلی اپ از API برنگشت؛ این تنظیم از پنل لیارا انجام شود")
+        c.app_toggle(proj, feature, bool(on))
+        return {"ok": True, "setting": setting, "on": bool(on)}
+
+    def list_disks(name):
+        sec.validate_app_name(name)
+        proj = c.get_project(name)
+        return {"disks": _as_list(c.disks(proj), "disks", limit=50)}
+
+    def create_disk(name, disk_name, size_gb=5):
+        sec.validate_app_name(name); sec.validate_id(disk_name)
+        size = max(1, min(int(size_gb), 1000))
+        c.create_disk(name, disk_name, size)
+        return {"ok": True, "disk": disk_name, "size_gb": size}
+
+    def resize_disk(name, disk_name, size_gb):
+        sec.validate_app_name(name); sec.validate_id(disk_name)
+        size = max(1, min(int(size_gb), 1000))
+        c.resize_disk(name, disk_name, size)
+        return {"ok": True, "disk": disk_name, "size_gb": size}
+
+    def delete_disk(name, disk_name):
+        sec.validate_app_name(name); sec.validate_id(disk_name)
+        c.delete_disk(c.get_project(name), disk_name)
+        return {"ok": True, "deleted_disk": disk_name}
+
+    def list_disk_backups(name, disk_name):
+        sec.validate_app_name(name); sec.validate_id(disk_name)
+        return {"backups": _as_list(c.disk_backups(c.get_project(name), disk_name), "backups", limit=50)}
+
+    def create_disk_backup(name, disk_name):
+        sec.validate_app_name(name); sec.validate_id(disk_name)
+        c.create_disk_backup(c.get_project(name), disk_name)
+        return {"ok": True, "note": "بکاپ دیسک در صف ساخت قرار گرفت."}
+
+    def download_disk_backup(name, disk_name, backup_name):
+        sec.validate_app_name(name); sec.validate_id(disk_name); sec.validate_id(backup_name)
+        r = c.download_disk_backup(c.get_project(name), disk_name, backup_name)
+        return {"ok": True, "link": (r or {}).get("link", "") if isinstance(r, dict) else "",
+                "note": "لینک دانلود موقت است؛ همین حالا دانلود کنید."}
+
+    # ================= دیتابیس‌ها =================
+    def _resolve_db(ref):
+        """ارجاع کاربر (هاست‌نیم/شناسه/نام دیتابیس) ← رکورد کامل دیتابیس. رمز در رکورد خام می‌ماند و فقط داخل ابزار استفاده می‌شود."""
+        dbs = [d for d in c.list_databases() if isinstance(d, dict)]
+        ref = str(ref or "").strip()
+        if not ref and len(dbs) == 1:
+            return dbs[0]
+        for d in dbs:
+            if ref in (str(d.get("hostname", "")), str(d.get("id", "")), str(d.get("DBId", "")), str(d.get("dbName", ""))):
+                return d
+        names = "، ".join(str(d.get("hostname") or d.get("id")) for d in dbs) or "(هیچ دیتابیسی ندارید)"
+        raise ValidationError(f"دیتابیس «{ref}» پیدا نشد. دیتابیس‌های شما: {names}")
+
+    def _db_id(db):
+        return str(db.get("id") or db.get("DBId") or db.get("hostname") or "")
+
+    def list_databases():
+        return {"databases": [_safe_db({k: d.get(k) for k in ("hostname", "type", "status", "scale", "planID",
+                                                              "version", "publicNetwork", "volumeSize", "created_at", "id")})
+                              for d in c.list_databases() if isinstance(d, dict)]}
+
+    def database_status(ref):
+        db = _resolve_db(ref)
+        full = c.get_database(_db_id(db))
+        merged = {**db, **(full if isinstance(full, dict) else {})}
+        out = _safe_db(merged)
+        node = merged.get("node") or {}
+        out["connection"] = {"host": node.get("host") or merged.get("hostname"), "port": merged.get("port"),
+                             "internal_port": merged.get("internalPort"), "username": merged.get("username"),
+                             "db_name": merged.get("dbName"), "password": "*** (در پنل لیارا قابل مشاهده است)"}
+        return out
+
+    def turn_database_on(ref):
+        db = _resolve_db(ref); c.scale_database(_db_id(db), True)
+        return {"ok": True, "database": db.get("hostname"), "on": True}
+
+    def turn_database_off(ref):
+        db = _resolve_db(ref); c.scale_database(_db_id(db), False)
+        return {"ok": True, "database": db.get("hostname"), "on": False}
+
+    def create_database(hostname, db_type, plan="", version="", public_network=False):
+        sec.validate_app_name(hostname)
+        t = str(db_type).lower().strip()
+        if t not in DB_TYPES:
+            raise LiaraAPIError(400, "نوع دیتابیس مجاز: " + "، ".join(DB_TYPES))
+        cat = _catalog(c)
+        if not plan:
+            avail = [p for p in cat["databases"] if p.get("available")]
+            if not avail:
+                raise LiaraAPIError(502, "کاتالوگ پلن‌های دیتابیس از API برنگشت؛ plan را صریح بدهید")
+            plan = avail[0]["id"]
+        sec.validate_plan(plan)
+        if not version:
+            dv = (cat.get("default_database_versions") or {}).get(t)
+            version = str(dv.get("value", "")) if isinstance(dv, dict) else (str(dv) if dv else "")
+        r = c.create_database(hostname, t, plan, version, bool(public_network))
+        return {"ok": True, "hostname": hostname, "type": t, "plan": plan, "version": version or "(پیش‌فرض لیارا)",
+                "databaseID": (r or {}).get("databaseID", "") if isinstance(r, dict) else "",
+                "note": "دیتابیس در حال ساخته‌شدن است؛ چند لحظه بعد وضعیتش را بپرسید. رمز root در پنل لیارا نمایش داده می‌شود."}
+
+    def delete_database(ref):
+        db = _resolve_db(ref); c.delete_database(_db_id(db))
+        return {"ok": True, "deleted": db.get("hostname")}
+
+    def resize_database(ref, plan):
+        db = _resolve_db(ref); sec.validate_plan(plan)
+        c.resize_database(_db_id(db), plan)
+        return {"ok": True, "database": db.get("hostname"), "plan": plan}
+
+    def list_database_backups(ref):
+        db = _resolve_db(ref)
+        return {"database": db.get("hostname"), "backups": _as_list(c.db_backups(_db_id(db)), "backups", limit=50)}
+
+    def create_database_backup(ref):
+        db = _resolve_db(ref); c.create_db_backup(_db_id(db))
+        return {"ok": True, "database": db.get("hostname"), "note": "بکاپ در صف ساخت قرار گرفت؛ کمی بعد در فهرست بکاپ‌ها می‌آید."}
+
+    def download_database_backup(ref, backup_name=""):
+        db = _resolve_db(ref)
+        if not backup_name:
+            bks = _as_list(c.db_backups(_db_id(db)), "backups", limit=50)
+            if not bks:
+                raise LiaraAPIError(404, "برای این دیتابیس بکاپی وجود ندارد؛ اول یک بکاپ بسازید")
+            backup_name = str(bks[-1].get("name", "")) if isinstance(bks[-1], dict) else str(bks[-1])
+        sec.validate_id(backup_name)
+        r = c.download_db_backup(_db_id(db), backup_name)
+        return {"ok": True, "backup": backup_name, "link": (r or {}).get("link", "") if isinstance(r, dict) else "",
+                "note": "لینک دانلود موقت است؛ همین حالا دانلود کنید."}
+
+    def set_database_public_network(ref, on=True):
+        db = _resolve_db(ref); c.db_public_network(_db_id(db), bool(on))
+        return {"ok": True, "database": db.get("hostname"), "public_network": bool(on)}
+
+    def set_database_control_panel(ref, on=True):
+        db = _resolve_db(ref); r = c.db_control_panel(_db_id(db), bool(on))
+        return {"ok": True, "database": db.get("hostname"), "control_panel": bool(on),
+                "controlPanelID": (r or {}).get("controlPanelID", "") if isinstance(r, dict) else ""}
+
+    def database_metrics(ref):
+        db = _resolve_db(ref)
+        raw = c.db_metrics(_db_id(db))
+        d = metrics_detail(raw, _limits_for(c, db.get("planID", ""), "databases"))
+        return {"database": db.get("hostname"), "cpu": d["cpu"], "memory": d["memory"], "disk": d["disk"],
+                "cpu_cores": d["cpu_cores"], "memory_human": fmt_bytes(d["memory_bytes"]),
+                "usable": d["usable"], "issues": d["issues"]}
+
+    def database_events(ref):
+        db = _resolve_db(ref)
+        return {"database": db.get("hostname"), "events": _as_list(c.db_events(db.get("hostname") or _db_id(db)), "events")}
+
+    # ================= دامنه‌ها =================
+    def list_domains():
+        out = []
+        for d in c.list_domains():
+            if not isinstance(d, dict):
+                continue
+            proj = d.get("project") or {}
+            out.append({"name": d.get("name"), "status": d.get("status"), "ssl": d.get("certificatesStatus"),
+                        "project": proj.get("project_id") if isinstance(proj, dict) else proj,
+                        "redirect_to": d.get("redirectTo") or "", "id": d.get("_id") or d.get("id")})
+        return {"domains": out}
+
+    def _resolve_domain(domain):
+        domain = sec.validate_domain(domain)
+        for d in c.list_domains():
+            if isinstance(d, dict) and str(d.get("name", "")).lower() == domain:
+                return d
+        raise ValidationError(f"دامنه‌ی «{domain}» در حساب شما ثبت نشده است")
+
+    def _domain_id(d):
+        return str(d.get("_id") or d.get("id") or "")
+
+    def add_domain(domain, name):
+        domain = sec.validate_domain(domain); sec.validate_app_name(name)
+        r = c.create_domain(domain, name)
+        return {"ok": True, "domain": domain, "app": name,
+                "note": "دامنه ثبت شد. حالا رکوردهای DNSای را که لیارا نشان می‌دهد در پنل ثبت‌کننده‌ی دامنه وارد کنید؛ "
+                        "بعد از انتشار DNS، SSL را با ابزار enable_ssl فعال کنید.",
+                "raw": r if isinstance(r, dict) else {}}
+
+    def attach_domain(domain, name):
+        d = _resolve_domain(domain); sec.validate_app_name(name)
+        proj = c.get_project(name)
+        pid = str(proj.get("_id") or proj.get("id") or "")
+        if not pid:
+            raise LiaraAPIError(502, "شناسه‌ی داخلی اپ از API برنگشت")
+        c.set_domain_project(_domain_id(d), pid)
+        return {"ok": True, "domain": domain, "app": name}
+
+    def check_domain(domain):
+        d = _resolve_domain(domain)
+        return {"domain": domain, "check": c.check_domain(_domain_id(d))}
+
+    def enable_ssl(domain):
+        domain = sec.validate_domain(domain)
+        return {"ok": True, "domain": domain, "result": c.enable_ssl(domain),
+                "note": "صدور گواهی چند دقیقه طول می‌کشد؛ DNS باید قبلاً به لیارا اشاره کرده باشد."}
+
+    def disable_ssl(domain):
+        d = _resolve_domain(domain); c.disable_ssl(_domain_id(d))
+        return {"ok": True, "domain": domain, "ssl": False}
+
+    def set_domain_redirect(domain, to, status=301):
+        d = _resolve_domain(domain)
+        if int(status) not in (301, 302):
+            raise LiaraAPIError(400, "کد ریدایرکت فقط 301 یا 302 است")
+        to = sec.validate_domain(str(to).removeprefix("https://").removeprefix("http://").split("/")[0])
+        c.set_redirect(_domain_id(d), to, int(status))
+        return {"ok": True, "domain": domain, "redirect_to": to, "status": int(status)}
+
+    def delete_domain(domain):
+        d = _resolve_domain(domain); c.delete_domain(_domain_id(d))
+        return {"ok": True, "deleted": domain}
+
+    # ================= حساب =================
+    def account_info():
+        d = c.me() if hasattr(c, "me") else {}
+        u = d.get("user", {}) if isinstance(d, dict) else {}
+        team = d.get("team", {}) if isinstance(d, dict) else {}
+        return {"fullname": u.get("fullname"), "email": u.get("email"),
+                "balance": (team or u).get("balance"),
+                "apps": len(c.list_projects()), "databases": len(c.list_databases()),
+                "domains": len(c.list_domains())}
+
     HU = {"health_url": S}
     T = [
         Tool("list_apps", "فهرست اپ‌های حساب", _obj({}), "low", list_apps),
@@ -259,7 +649,25 @@ def build_tools(c):
         Tool("diagnose_app", "عیب‌یابی: وضعیت+لاگ(+منابع در صورت دسترسی) ← علت‌های رتبه‌بندی‌شده با ذکر منبع داده", _obj({"name": S}, ["name"]), "low", diagnose),
         Tool("get_env_vars", "نام متغیرهای محیطی (مقادیر مخفی)", _obj({"name": S}, ["name"]), "low", env_vars),
         Tool("health_check", "بررسی در دسترس بودن سایت از بیرون (فقط آدرس عمومی http/https)", _obj({"url": S}, ["url"]), "low", health),
-        Tool("get_plans", "فهرست پلن‌ها (تأییدنشده در مستندات؛ پیش‌فرض غیرفعال)", _obj({}), "low", plans),
+        Tool("get_plans", "کاتالوگ پلن‌ها از /v1/me (kind: apps یا databases) با RAM/CPU/قیمت",
+             _obj({"kind": S}), "low", plans),
+        Tool("get_metric_history", "سری زمانی CPU/RAM اپ برای نمودار (پیش‌فرض ۶۰ دقیقه)",
+             _obj({"name": S, "minutes": {"type": "integer"}}, ["name"]), "low", metric_history),
+        Tool("app_events", "رویدادهای اپ (ری‌استارت، OOM و ...)", _obj({"name": S}, ["name"]), "low", app_events),
+        Tool("app_releases", "فهرست ریلیزها/دیپلوی‌های اپ", _obj({"name": S}, ["name"]), "low", app_releases),
+        Tool("list_disks", "دیسک‌های یک اپ", _obj({"name": S}, ["name"]), "low", list_disks),
+        Tool("list_disk_backups", "بکاپ‌های یک دیسک", _obj({"name": S, "disk_name": S}, ["name", "disk_name"]), "low", list_disk_backups),
+        Tool("account_info", "خلاصه‌ی حساب لیارا: کاربر، موجودی (اگر API بدهد)، تعداد اپ/دیتابیس/دامنه", _obj({}), "low", account_info),
+        # --- دیتابیس‌ها (خواندنی) ---
+        Tool("list_databases", "فهرست همه‌ی دیتابیس‌های حساب (بدون رمز)", _obj({}), "low", list_databases),
+        Tool("database_status", "جزئیات یک دیتابیس + اطلاعات اتصال (رمز هرگز نمایش داده نمی‌شود)",
+             _obj({"ref": S}, ["ref"]), "low", database_status),
+        Tool("database_metrics", "مصرف منابع یک دیتابیس", _obj({"ref": S}, ["ref"]), "low", database_metrics),
+        Tool("database_events", "رویدادهای یک دیتابیس", _obj({"ref": S}, ["ref"]), "low", database_events),
+        Tool("list_database_backups", "فهرست بکاپ‌های یک دیتابیس", _obj({"ref": S}, ["ref"]), "low", list_database_backups),
+        # --- دامنه‌ها (خواندنی) ---
+        Tool("list_domains", "فهرست دامنه‌های حساب و وضعیت SSL/اتصالشان", _obj({}), "low", list_domains),
+        Tool("check_domain", "بررسی وضعیت یک دامنه در لیارا (DNS/صدور)", _obj({"domain": S}, ["domain"]), "low", check_domain),
         Tool("recommend_plan", "تخمین محلی منابع بر اساس نوع پروژه (kind: node/python/php/java/static)",
              _obj({"kind": S, "traffic": S, "has_db": {"type": "boolean"}}, ["kind"]), "low", recommend),
         Tool("detect_project", "تشخیص نوع پروژه از پوشه‌ی کد (داخل پوشه‌ی پروژه)", _obj({"path": S}), "low", detect_project),
@@ -276,8 +684,76 @@ def build_tools(c):
              lambda a: f"اپ «{a['name']}» ری‌استارت می‌شود (چند ثانیه قطعی)."),
         Tool("resize_app", "تغییر پلن/منابع (هزینه تغییر می‌کند)", _obj({"name": S, "plan": S}, ["name", "plan"]), "high", resize,
              lambda a: f"پلن «{a['name']}» به «{a['plan']}» تغییر می‌کند؛ هزینه و احتمالاً ری‌استارت دارد."),
-        Tool("set_env_var", "تنظیم یک متغیر محیطی (قالب API تأیید نشده؛ پیش‌فرض غیرفعال)", _obj({"name": S, "key": S, "value": S}, ["name", "key", "value"]), "high", set_env,
-             lambda a: f"متغیر «{a['key']}» در «{a['name']}» تنظیم می‌شود."),
+        Tool("set_env_var", "تنظیم یک متغیر محیطی (با خواندن و merge کردن بقیه؛ چون updateEnvs لیارا جایگزینی کامل است)",
+             _obj({"name": S, "key": S, "value": S}, ["name", "key", "value"]), "high", set_env,
+             lambda a: f"متغیر «{a['key']}» در «{a['name']}» تنظیم می‌شود و اپ ری‌استارت می‌شود."),
+        Tool("delete_env_var", "حذف یک متغیر محیطی از اپ", _obj({"name": S, "key": S}, ["name", "key"]), "high", delete_env,
+             lambda a: f"متغیر «{a['key']}» از «{a['name']}» حذف و اپ ری‌استارت می‌شود."),
+        Tool("turn_app_off", "خاموش کردن اپ (scale=0؛ هزینه‌ی اجرا متوقف می‌شود ولی سایت پایین می‌آید)",
+             _obj({"name": S}, ["name"]), "high", turn_app_off,
+             lambda a: f"اپ «{a['name']}» خاموش می‌شود و سایت از دسترس خارج می‌شود (تا وقتی دوباره روشنش کنید)."),
+        Tool("turn_app_on", "روشن کردن اپ (scale=1)", _obj({"name": S}, ["name"]), "high", turn_app_on,
+             lambda a: f"اپ «{a['name']}» روشن می‌شود."),
+        Tool("create_app", "ساخت اپ جدید در لیارا (هزینه‌ی ساعتی دارد)",
+             _obj({"name": S, "platform": S, "plan": S, "network": S}, ["name", "platform"]), "high", create_app,
+             lambda a: f"اپ جدید «{a['name']}» با پلتفرم {a['platform']}" + (f" و پلن «{a['plan']}»" if a.get("plan") else " و ارزان‌ترین پلن") + " ساخته می‌شود و هزینه‌ی ساعتی دارد."),
+        Tool("delete_app", "حذف کامل یک اپ (برگشت‌ناپذیر!)", _obj({"name": S}, ["name"]), "high", delete_app,
+             lambda a: f"⚠️ اپ «{a['name']}» و همه‌ی داده‌های روی آن برای همیشه حذف می‌شود. این کار برگشت ندارد!"),
+        Tool("app_setting", "تغییر تنظیمات اپ: zero_downtime | default_subdomain | fixed_ip | read_only",
+             _obj({"name": S, "setting": S, "on": {"type": "boolean"}}, ["name", "setting", "on"]), "high", app_setting,
+             lambda a: f"تنظیم «{a['setting']}» برای اپ «{a['name']}» {'فعال' if a.get('on') else 'غیرفعال'} می‌شود."),
+        Tool("create_disk", "ساخت دیسک جدید برای اپ (هزینه دارد)", _obj({"name": S, "disk_name": S, "size_gb": {"type": "integer"}}, ["name", "disk_name"]), "high", create_disk,
+             lambda a: f"دیسک «{a['disk_name']}» با حجم {a.get('size_gb', 5)}GB برای اپ «{a['name']}» ساخته می‌شود."),
+        Tool("resize_disk", "تغییر حجم دیسک اپ", _obj({"name": S, "disk_name": S, "size_gb": {"type": "integer"}}, ["name", "disk_name", "size_gb"]), "high", resize_disk,
+             lambda a: f"حجم دیسک «{a['disk_name']}» اپ «{a['name']}» به {a['size_gb']}GB تغییر می‌کند."),
+        Tool("delete_disk", "حذف دیسک اپ (همه‌ی فایل‌هایش پاک می‌شود!)", _obj({"name": S, "disk_name": S}, ["name", "disk_name"]), "high", delete_disk,
+             lambda a: f"⚠️ دیسک «{a['disk_name']}» اپ «{a['name']}» با همه‌ی فایل‌هایش حذف می‌شود!"),
+        Tool("create_disk_backup", "بکاپ گرفتن از دیسک اپ", _obj({"name": S, "disk_name": S}, ["name", "disk_name"]), "high", create_disk_backup,
+             lambda a: f"از دیسک «{a['disk_name']}» اپ «{a['name']}» بکاپ گرفته می‌شود (فضای بکاپ هزینه دارد)."),
+        Tool("download_disk_backup", "دریافت لینک دانلود بکاپ دیسک", _obj({"name": S, "disk_name": S, "backup_name": S}, ["name", "disk_name", "backup_name"]), "high", download_disk_backup,
+             lambda a: f"لینک دانلود بکاپ «{a['backup_name']}» ساخته می‌شود. هرکس لینک را داشته باشد می‌تواند دانلود کند."),
+        # --- دیتابیس‌ها (عملیاتی) ---
+        Tool("turn_database_off", "خاموش کردن دیتابیس (اپ‌های متصل دیگر به آن وصل نمی‌شوند!)",
+             _obj({"ref": S}, ["ref"]), "high", turn_database_off,
+             lambda a: f"دیتابیس «{a['ref']}» خاموش می‌شود؛ هر اپی به آن وصل است خطای اتصال می‌گیرد تا دوباره روشن شود."),
+        Tool("turn_database_on", "روشن کردن دیتابیس", _obj({"ref": S}, ["ref"]), "high", turn_database_on,
+             lambda a: f"دیتابیس «{a['ref']}» روشن می‌شود."),
+        Tool("create_database", "ساخت دیتابیس جدید (mysql/postgres/mongodb/redis/...؛ هزینه‌ی ساعتی دارد)",
+             _obj({"hostname": S, "db_type": S, "plan": S, "version": S, "public_network": {"type": "boolean"}}, ["hostname", "db_type"]), "high", create_database,
+             lambda a: f"دیتابیس {a['db_type']} با نام «{a['hostname']}»" + (f" و پلن «{a['plan']}»" if a.get("plan") else " و ارزان‌ترین پلن") + " ساخته می‌شود و هزینه‌ی ساعتی دارد."),
+        Tool("delete_database", "حذف کامل دیتابیس و همه‌ی داده‌هایش (برگشت‌ناپذیر!)",
+             _obj({"ref": S}, ["ref"]), "high", delete_database,
+             lambda a: f"⚠️ دیتابیس «{a['ref']}» با تمام داده‌هایش برای همیشه حذف می‌شود. اول بکاپ بگیرید! برگشتی ندارد."),
+        Tool("resize_database", "تغییر پلن دیتابیس (هزینه تغییر می‌کند)", _obj({"ref": S, "plan": S}, ["ref", "plan"]), "high", resize_database,
+             lambda a: f"پلن دیتابیس «{a['ref']}» به «{a['plan']}» تغییر می‌کند."),
+        Tool("create_database_backup", "بکاپ گرفتن از دیتابیس", _obj({"ref": S}, ["ref"]), "high", create_database_backup,
+             lambda a: f"از دیتابیس «{a['ref']}» بکاپ گرفته می‌شود (فضای بکاپ هزینه دارد)."),
+        Tool("download_database_backup", "دریافت لینک دانلود بکاپ دیتابیس (بدون backup_name آخرین بکاپ)",
+             _obj({"ref": S, "backup_name": S}, ["ref"]), "high", download_database_backup,
+             lambda a: f"لینک دانلود بکاپ دیتابیس «{a['ref']}» ساخته می‌شود؛ داده‌ی حساسی است، لینک را جایی عمومی نگذارید."),
+        Tool("set_database_public_network", "روشن/خاموش کردن دسترسی عمومی (اینترنت) به دیتابیس — امنیتی!",
+             _obj({"ref": S, "on": {"type": "boolean"}}, ["ref", "on"]), "high", set_database_public_network,
+             lambda a: f"شبکه‌ی عمومی دیتابیس «{a['ref']}» {'فعال می‌شود (از اینترنت قابل دسترسی می‌شود — ریسک امنیتی!)' if a.get('on') else 'غیرفعال می‌شود (فقط شبکه‌ی داخلی لیارا)'}."),
+        Tool("set_database_control_panel", "فعال/غیرفعال کردن پنل وب مدیریت دیتابیس (مثل phpMyAdmin)",
+             _obj({"ref": S, "on": {"type": "boolean"}}, ["ref", "on"]), "high", set_database_control_panel,
+             lambda a: f"پنل مدیریت وب دیتابیس «{a['ref']}» {'فعال' if a.get('on') else 'غیرفعال'} می‌شود."),
+        # --- دامنه‌ها (عملیاتی) ---
+        Tool("add_domain", "افزودن دامنه به یک اپ (بعدش باید DNS تنظیم شود)",
+             _obj({"domain": S, "name": S}, ["domain", "name"]), "high", add_domain,
+             lambda a: f"دامنه‌ی «{a['domain']}» به اپ «{a['name']}» اضافه می‌شود."),
+        Tool("attach_domain", "وصل کردن یک دامنه‌ی ثبت‌شده به اپ دیگر",
+             _obj({"domain": S, "name": S}, ["domain", "name"]), "high", attach_domain,
+             lambda a: f"دامنه‌ی «{a['domain']}» به اپ «{a['name']}» منتقل/وصل می‌شود."),
+        Tool("enable_ssl", "فعال‌سازی گواهی SSL رایگان برای دامنه (DNS باید قبلاً درست باشد)",
+             _obj({"domain": S}, ["domain"]), "high", enable_ssl,
+             lambda a: f"برای دامنه‌ی «{a['domain']}» گواهی SSL صادر و فعال می‌شود."),
+        Tool("disable_ssl", "غیرفعال کردن SSL دامنه", _obj({"domain": S}, ["domain"]), "high", disable_ssl,
+             lambda a: f"SSL دامنه‌ی «{a['domain']}» غیرفعال می‌شود؛ سایت با http و هشدار مرورگر باز می‌شود."),
+        Tool("set_domain_redirect", "ریدایرکت یک دامنه به دامنه‌ی دیگر (301/302)",
+             _obj({"domain": S, "to": S, "status": {"type": "integer"}}, ["domain", "to"]), "high", set_domain_redirect,
+             lambda a: f"دامنه‌ی «{a['domain']}» به «{a['to']}» ریدایرکت می‌شود."),
+        Tool("delete_domain", "حذف دامنه از حساب لیارا", _obj({"domain": S}, ["domain"]), "high", delete_domain,
+             lambda a: f"⚠️ دامنه‌ی «{a['domain']}» از لیارا حذف می‌شود و دیگر به اپی وصل نیست."),
     ]
     return {t.name: t for t in T}
 
@@ -305,6 +781,8 @@ def execute(tools: dict, name: str, args: dict, confirmed: bool = False) -> dict
         return {"status": "error", "message": e.message, "http": e.status}
     except TypeError as e:
         return {"status": "invalid_input", "message": f"پارامتر نامعتبر: {e}"}
+    except Exception as e:      # هرگز کرش نکن؛ خطای تمیز به کاربر/مدل بده
+        return {"status": "error", "message": f"خطای پیش‌بینی‌نشده در ابزار «{name}»: {type(e).__name__}: {str(e)[:160]}"}
 
 
 def two_step(tools, store, name, args, token=""):

@@ -14,6 +14,9 @@ MAX_BODY, LOCK = 65536, threading.RLock()
 S = {"tools": None, "st": brain.new_state(), "port": 8080, "chat_times": deque()}
 
 
+_SEED_AT = {}
+
+
 def status(name, url=""):
     t = S["tools"]
     a = execute(t, "app_status", {"name": name})
@@ -29,7 +32,30 @@ def status(name, url=""):
         out["health"] = h["result"] if h["status"] == "ok" else {"ok": False, "error": h.get("message", "")}
     out["score"], out["score_reasons"] = insights.health_score(out, metrics, out.get("health"))
     out["alerts"] = insights.alerts(out, metrics, out.get("health"))
-    out["history"] = insights.record(name, metrics)
+    hist = insights.record(name, metrics)
+    # نمودار از همان لحظه‌ی اول خالی نماند: حداکثر هر ۵ دقیقه یک‌بار تاریخچه‌ی واقعی از API سید می‌شود.
+    if len([x for x in hist if not x.get("demo")]) < 3 and time.time() - _SEED_AT.get(name, 0) > 300:
+        _SEED_AT[name] = time.time()
+        hr = execute(t, "get_metric_history", {"name": name, "minutes": 180})
+        if hr["status"] == "ok" and hr["result"]["points"]:
+            hist = insights.seed(name, hr["result"]["points"])
+    out["history"] = hist
+    return out
+
+
+def overview():
+    """نمای کلی پنل برای سایدبار: دیتابیس‌ها و دامنه‌ها (خطا → لیست خالی + یادداشت، تا UI خراب نشود)."""
+    t = S["tools"]
+    out = {"databases": [], "domains": [], "note": ""}
+    d = execute(t, "list_databases", {})
+    if d["status"] == "ok":
+        out["databases"] = [{k: x.get(k) for k in ("hostname", "type", "state", "state_fa", "scale", "planID")}
+                            for x in d["result"]["databases"]]
+    else:
+        out["note"] = brain._err(d)[:120]
+    dm = execute(t, "list_domains", {})
+    if dm["status"] == "ok":
+        out["domains"] = [{k: x.get(k) for k in ("name", "status", "ssl", "project")} for x in dm["result"]["domains"]]
     return out
 
 
@@ -115,6 +141,8 @@ class H(BaseHTTPRequestHandler):
                 return self._send({"entries": audit.entries()})
             if u.path == "/api/status":
                 return self._send(status(q.get("name", ""), q.get("url", "")))
+            if u.path == "/api/overview":
+                return self._send(overview())
         self._send({"error": "not found"}, 404)
 
     def do_POST(self):
